@@ -1,83 +1,131 @@
+"""A small NumPy convolution layer for single images in (channels, height, width) order."""
+
 import numpy as np
 
+
 class Conv2D:
-    """2D Convolutional Layer with learnable filters and biases."""
-    
+    """Apply learnable square filters and propagate gradients through the operation."""
+
     def __init__(self, num_filters, filter_size, stride=1, padding=0):
+        if num_filters <= 0 or filter_size <= 0 or stride <= 0 or padding < 0:
+            raise ValueError("Filters and stride must be positive; padding cannot be negative.")
+
         self.num_filters = num_filters
         self.filter_size = filter_size
         self.stride = stride
         self.padding = padding
-        self.W = None  # Shape: (num_filters, C_in, f, f)
-        self.b = None  # Shape: (num_filters, 1)
+        self.W = None  # (filters, input channels, filter height, filter width)
+        self.b = None  # One bias per output filter.
 
     def forward(self, X):
-        """
-        Input X shape: (C_in, H, W)
-        Output shape:  (num_filters, H_out, W_out)
-        """
-        C_in, H, W = X.shape
-        f, s, p = self.filter_size, self.stride, self.padding
+        """Return feature maps for an input shaped (channels, height, width)."""
+        X = np.asarray(X)
+        if X.ndim != 3:
+            raise ValueError("Conv2D expects input shaped (channels, height, width).")
 
-        # He / He-normal parameter initialization
+        channels, height, width = X.shape
+        if channels == 0:
+            raise ValueError("Conv2D input must contain at least one channel.")
+        filter_size, stride, padding = (
+            self.filter_size,
+            self.stride,
+            self.padding,
+        )
+
+        if height + 2 * padding < filter_size or width + 2 * padding < filter_size:
+            raise ValueError("The filter must fit inside the padded input.")
+
         if self.W is None:
-            self.W = np.random.randn(self.num_filters, C_in, f, f) * np.sqrt(2.0 / (C_in * f * f))
-            self.b = np.zeros((self.num_filters, 1))
+            # He initialization keeps activations at a useful scale before ReLU.
+            scale = np.sqrt(2.0 / (channels * filter_size * filter_size))
+            self.W = np.random.randn(
+                self.num_filters, channels, filter_size, filter_size
+            ) * scale
+            self.b = np.zeros(self.num_filters)
+        elif self.W.shape[1] != channels:
+            raise ValueError(
+                f"This layer was initialized for {self.W.shape[1]} input channels, "
+                f"but received {channels}."
+            )
 
-        # Pad spatial dimensions
-        if p > 0:
-            self.X_padded = np.pad(X, ((0, 0), (p, p), (p, p)), mode='constant')
+        if padding:
+            self.X_padded = np.pad(
+                X,
+                ((0, 0), (padding, padding), (padding, padding)),
+                mode="constant",
+            )
         else:
             self.X_padded = X
 
-        H_pad, W_pad = self.X_padded.shape[1], self.X_padded.shape[2]
-        H_out = (H_pad - f) // s + 1
-        W_out = (W_pad - f) // s + 1
+        padded_height, padded_width = self.X_padded.shape[1:]
+        out_height = (padded_height - filter_size) // stride + 1
+        out_width = (padded_width - filter_size) // stride + 1
+        out = np.zeros((self.num_filters, out_height, out_width))
 
-        out = np.zeros((self.num_filters, H_out, W_out))
-
-        # Forward spatial convolution
-        for n in range(self.num_filters):
-            for i in range(H_out):
-                for j in range(W_out):
-                    h_st, w_st = i * s, j * s
-                    slice_3d = self.X_padded[:, h_st:h_st + f, w_st:w_st + f]
-                    out[n, i, j] = np.sum(slice_3d * self.W[n]) + self.b[n]
+        # Each output value is the sum of elementwise input/filter products plus bias.
+        for filter_index in range(self.num_filters):
+            for row in range(out_height):
+                for column in range(out_width):
+                    row_start, column_start = row * stride, column * stride
+                    patch = self.X_padded[
+                        :,
+                        row_start : row_start + filter_size,
+                        column_start : column_start + filter_size,
+                    ]
+                    out[filter_index, row, column] = (
+                        np.sum(patch * self.W[filter_index]) + self.b[filter_index]
+                    )
 
         self.last_input_shape = X.shape
+        self.last_output_shape = out.shape
         return out
 
     def backward(self, d_out, lr=0.01):
-        """
-        Computes gradients with respect to weights (dW), biases (db),
-        updates parameters, and returns input gradient (dX).
-        """
-        C_in, H, W = self.last_input_shape
-        f, s, p = self.filter_size, self.stride, self.padding
-        num_filters, H_out, W_out = d_out.shape
+        """Return the input gradient and update filters and biases using SGD."""
+        if not hasattr(self, "last_input_shape"):
+            raise RuntimeError("Call forward() before backward().")
+        if d_out.shape != self.last_output_shape:
+            raise ValueError(
+                f"Expected output gradient shape {self.last_output_shape}, "
+                f"got {d_out.shape}."
+            )
 
+        filter_size, stride, padding = (
+            self.filter_size,
+            self.stride,
+            self.padding,
+        )
         dW = np.zeros_like(self.W)
         db = np.zeros_like(self.b)
-        dX_padded = np.zeros_like(self.X_padded)
+        # Gradients can be fractional even when the original image had integer pixels.
+        gradient_dtype = np.result_type(
+            self.X_padded.dtype, d_out.dtype, self.W.dtype
+        )
+        dX_padded = np.zeros(self.X_padded.shape, dtype=gradient_dtype)
 
-        for n in range(num_filters):
-            for i in range(H_out):
-                for j in range(W_out):
-                    h_st, w_st = i * s, j * s
-                    slice_3d = self.X_padded[:, h_st:h_st + f, w_st:w_st + f]
+        for filter_index in range(self.num_filters):
+            for row in range(d_out.shape[1]):
+                for column in range(d_out.shape[2]):
+                    row_start, column_start = row * stride, column * stride
+                    patch = self.X_padded[
+                        :,
+                        row_start : row_start + filter_size,
+                        column_start : column_start + filter_size,
+                    ]
+                    gradient = d_out[filter_index, row, column]
 
-                    # Gradient wrt weights and biases
-                    dW[n] += d_out[n, i, j] * slice_3d
-                    db[n] += d_out[n, i, j]
+                    # Accumulate contributions because filter windows can overlap.
+                    dW[filter_index] += gradient * patch
+                    db[filter_index] += gradient
+                    dX_padded[
+                        :, row_start : row_start + filter_size,
+                        column_start : column_start + filter_size,
+                    ] += gradient * self.W[filter_index]
 
-                    # Gradient wrt padded input
-                    dX_padded[:, h_st:h_st + f, w_st:w_st + f] += d_out[n, i, j] * self.W[n]
-
-        # Parameter update step
+        # Use the current filters for dX above, then update parameters for the next pass.
         self.W -= lr * dW
         self.b -= lr * db
 
-        # Crop out padding to return gradient matching original input shape
-        if p > 0:
-            return dX_padded[:, p:-p, p:-p]
+        if padding:
+            return dX_padded[:, padding:-padding, padding:-padding]
         return dX_padded

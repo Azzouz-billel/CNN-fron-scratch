@@ -1,13 +1,23 @@
-import numpy as np
+"""Shape conversion layer used between convolutional features and a dense layer."""
+
+from math import prod
+
 
 class Flatten:
-    """Converts multi-dimensional feature tensor into a 1D vector."""
-    
+    """Turn a feature tensor into a column vector without changing its element order."""
+
     def forward(self, X):
-        self.orig_shape = X.shape  # Store (C, H, W)
-        return X.flatten().reshape(-1, 1)  # Output shape: (C*H*W, 1)
+        # Save the exact incoming shape so backward can restore all feature dimensions.
+        self.orig_shape = X.shape
+        return X.reshape(-1, 1)
 
     def backward(self, d_out):
-        """Reshapes 1D gradient vector back to multi-dimensional tensor shape."""
+        """Restore the gradient to the shape of the tensor that entered forward()."""
+        if not hasattr(self, "orig_shape"):
+            raise RuntimeError("Call forward() before backward().")
+        expected_size = prod(self.orig_shape)
+        if d_out.size != expected_size:
+            raise ValueError(
+                f"Gradient has {d_out.size} values; expected {expected_size}."
+            )
         return d_out.reshape(self.orig_shape)
-
